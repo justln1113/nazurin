@@ -392,15 +392,31 @@ class WebAPI(BaseAPI):
 
         # When using auth token, and e.g. the user limited who can reply,
         # the result is not a direct tweet type, the real tweet is nested.
-        if typename == "TweetWithVisibilityResults" or tweet.get("tweet"):
-            tweet = tweet["tweet"]
+        tweet = WebAPI._unwrap_visibility_result(tweet)
         tweet = WebAPI.normalize_tweet(tweet)
         # Return original tweet if it's a retweet
         retweet_original = tweet.get("retweeted_status_result")
         if retweet_original:
-            tweet = WebAPI.normalize_tweet(retweet_original["result"])
+            # The original tweet may itself be wrapped (e.g. limited visibility),
+            # so unwrap it before normalizing, otherwise normalize_tweet would
+            # fail with KeyError('legacy').
+            original = WebAPI._unwrap_visibility_result(retweet_original["result"])
+            tweet = WebAPI.normalize_tweet(original)
             logger.info("Is a retweet, original tweet: {}", tweet["id_str"])
         return tweet
+
+    @staticmethod
+    def _unwrap_visibility_result(result: dict) -> dict:
+        """
+        Unwrap a tweet result that may be wrapped in TweetWithVisibilityResults
+        (e.g. when the author limited who can reply), where the real tweet
+        object is nested under the "tweet" key.
+        """
+        if result.get("__typename") == "TweetWithVisibilityResults" or result.get(
+            "tweet",
+        ):
+            return result["tweet"]
+        return result
 
     @staticmethod
     def normalize_tweet(data: dict):
