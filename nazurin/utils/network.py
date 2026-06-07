@@ -50,6 +50,7 @@ class Request(ClientSession, NazurinRequestSession):
     ):
         headers = headers or {}
         headers.update({"User-Agent": UA})
+        self._timeout_seconds = timeout
         timeout = ClientTimeout(total=timeout)
 
         connector = None
@@ -65,7 +66,16 @@ class Request(ClientSession, NazurinRequestSession):
         )
 
     async def download(self, url: str, destination: str | os.PathLike):
-        async with self.get(url) as response:
+        # Use socket-level timeouts for downloads instead of a total timeout,
+        # so large or slow media don't fail just for taking a while, while still
+        # aborting on a genuinely stalled connection. Combined with the
+        # network_retry decorator on File.download, this avoids spurious
+        # "Timeout, please try again." errors on big images.
+        timeout = ClientTimeout(
+            sock_connect=self._timeout_seconds,
+            sock_read=self._timeout_seconds,
+        )
+        async with self.get(url, timeout=timeout) as response:
             if not response.ok:
                 logger.error("Download failed with status code {}", response.status)
                 logger.info("Response: {}", await response.content.read())
