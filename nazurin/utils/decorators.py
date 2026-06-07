@@ -5,7 +5,11 @@ from functools import partial, wraps
 from typing import ClassVar
 
 import tenacity
-from aiogram.exceptions import TelegramRetryAfter
+from aiogram.exceptions import (
+    TelegramNetworkError,
+    TelegramRetryAfter,
+    TelegramServerError,
+)
 from aiohttp import ClientError, ClientResponseError
 from async_lru import alru_cache
 from tenacity import retry_if_exception, stop_after_attempt, wait_exponential
@@ -39,6 +43,25 @@ network_retry = tenacity.retry(
     stop=stop_after_attempt(config.RETRIES),
     after=after_log,
     retry=retry_if_exception(exception_predicate),
+    wait=wait_exponential(multiplier=1, max=8),
+)
+
+
+def telegram_exception_predicate(exception):
+    """Retry on transient Telegram network / server errors.
+
+    Covers request timeouts (TelegramNetworkError, e.g. "Request timeout error")
+    and upstream 5xx errors (TelegramServerError). Flood limits are handled
+    separately by `retry_after`.
+    """
+    return isinstance(exception, TelegramNetworkError | TelegramServerError)
+
+
+telegram_retry = tenacity.retry(
+    reraise=True,
+    stop=stop_after_attempt(config.RETRIES),
+    after=after_log,
+    retry=retry_if_exception(telegram_exception_predicate),
     wait=wait_exponential(multiplier=1, max=8),
 )
 

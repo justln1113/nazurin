@@ -15,7 +15,7 @@ from nazurin.models import File, Illust, Ugoira
 from nazurin.sites import SiteManager
 from nazurin.storage import Storage
 from nazurin.utils import logger
-from nazurin.utils.decorators import retry_after
+from nazurin.utils.decorators import retry_after, telegram_retry
 from nazurin.utils.exceptions import AlreadyExistsError, NazurinError
 from nazurin.utils.helpers import (
     handle_bad_request,
@@ -29,7 +29,8 @@ TG_GROUP_SIZE_LIMIT = 50 * 1024 * 1024  # 50 MB
 
 
 class NazurinBot(Bot):
-    send_message = retry_after(Bot.send_message)
+    send_message = retry_after(telegram_retry(Bot.send_message))
+    send_animation = retry_after(telegram_retry(Bot.send_animation))
 
     def __init__(self, *args, **kwargs):
         session = AiohttpSession(proxy=config.PROXY) if config.PROXY else None
@@ -56,6 +57,7 @@ class NazurinBot(Bot):
             self.cleanup_task.cancel()
 
     @retry_after
+    @telegram_retry
     @flags.chat_action(ChatAction.UPLOAD_PHOTO)
     async def send_single_group(
         self,
@@ -130,6 +132,7 @@ class NazurinBot(Bot):
             await handle_bad_request(message, error)
 
     @retry_after
+    @telegram_retry
     @flags.chat_action(ChatAction.UPLOAD_DOCUMENT)
     async def send_doc(self, file: File, chat_id, message_id=None):
         await self.send_document(
