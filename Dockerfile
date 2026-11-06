@@ -1,4 +1,8 @@
 ARG PYTHON_VERSION=3.10
+ARG FFMPEG_VERSION=9.0.2-1
+
+# FFmpeg
+FROM mwader/static-ffmpeg:${FFMPEG_VERSION} AS ffmpeg
 
 # Builder
 FROM python:${PYTHON_VERSION}-alpine AS builder
@@ -20,20 +24,6 @@ WORKDIR /app
 COPY uv.lock pyproject.toml ./
 RUN uv sync --frozen --no-install-project --no-dev
 
-# Install FFmpeg
-ARG TARGETARCH
-ARG FFMPEG_VERSION=4.2.2
-
-# TARGETARCH is only auto-populated by BuildKit; the legacy builder leaves it
-# empty, which would produce a 404 URL. Fall back to detecting the build
-# machine's architecture, which is always correct for a non-BuildKit build
-# since those can't cross-compile anyway.
-RUN ARCH="${TARGETARCH:-$(apk --print-arch | sed -e 's/x86_64/amd64/' -e 's/aarch64/arm64/')}" && \
-    echo "Download from https://www.johnvansickle.com/ffmpeg/old-releases/ffmpeg-${FFMPEG_VERSION}-${ARCH}-static.tar.xz" && \
-    wget https://www.johnvansickle.com/ffmpeg/old-releases/ffmpeg-${FFMPEG_VERSION}-${ARCH}-static.tar.xz -O ffmpeg.tar.xz && \
-    tar Jxvf ./ffmpeg.tar.xz && \
-    cp ./ffmpeg-${FFMPEG_VERSION}-${ARCH}-static/ffmpeg /usr/local/bin/
-
 # Runtime
 FROM python:${PYTHON_VERSION}-alpine
 
@@ -46,7 +36,8 @@ ENV PYTHONUNBUFFERED=1
 RUN apk add --no-cache curl
 
 # Install FFmpeg
-COPY --from=builder /usr/local/bin/ffmpeg /usr/local/bin/
+COPY --from=ffmpeg /ffmpeg /ffprobe /usr/local/bin/
+RUN ffmpeg -version && ffprobe -version
 
 # NOTE: upstream copies cURL Impersonate binaries from /usr/local here, but
 # nothing in the builder stage ever puts them there -- curl-cffi vendors its
