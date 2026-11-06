@@ -1,12 +1,13 @@
 from __future__ import annotations
 
 import json
+import re
 import secrets
 from contextlib import asynccontextmanager
 from datetime import datetime, timezone
 from http import HTTPStatus
 from typing import TYPE_CHECKING, ClassVar
-from urllib.parse import urljoin, urlparse
+from urllib.parse import unquote, urljoin, urlparse
 
 import bs4
 from x_client_transaction import ClientTransaction
@@ -25,7 +26,7 @@ from nazurin.utils.helpers import fromasctimeformat
 from nazurin.utils.logging import logger
 from nazurin.utils.network import Request
 
-from ..config import AUTH_TOKEN
+from ..config import AUTH_TOKEN, USER_TWEETS_QUERY_ID
 from .base import BaseAPI
 
 
@@ -66,6 +67,14 @@ ERROR_MESSAGES = {
 }
 
 BASE_URL = "https://x.com"
+
+MAIN_JS_PATTERN = re.compile(
+    r"https://abs\.twimg\.com/responsive-web/client-web/main\.[\w-]+\.js"
+)
+USER_TWEETS_OPERATION_PATTERN = re.compile(
+    r'queryId:"([^"]+)",operationName:"UserTweets",operationType:"query",'
+    r"metadata:\{featureSwitches:\[([^\]]*)\]"
+)
 
 
 class WebAPI(BaseAPI):
@@ -218,6 +227,85 @@ class WebAPI(BaseAPI):
             logger.error("{} {}", msg, error)
             logger.info("{}", response)
             raise NazurinError(f"{msg} {error}") from error
+
+    async def user_tweets(self, user_id: str, cursor: str | None = None) -> dict:
+        """Fetch a page of the user's timeline (tweets and retweets)."""
+
+        query_id, feature_switches = await self._user_tweets_operation()
+        logger.debug("Fetching user {} tweets from web API /UserTweets", user_id)
+        api = f"{BASE_URL}/i/api/graphql/{query_id}/UserTweets"
+        self.headers.update({Headers.AUTHORIZATION: AuthorizationToken.LOGGED_IN})
+        variables = {
+            "userId": user_id,
+            "count": 20,
+            "includePromotedContent": False,
+            "withQuickPromoteEligibilityTweetFields": False,
+            "withVoice": True,
+        }
+        if cursor:
+            variables["cursor"] = cursor
+        # Send exactly the features this operation asks for,
+        # missing ones are rejected by the API
+        features = (
+            {name: WebAPI.features.get(name, False) for name in feature_switches}
+            if feature_switches
+            else WebAPI.features
+        )
+        params = {
+            "variables": json.dumps(variables),
+            "features": json.dumps(features),
+        }
+        await self._require_auth()
+        response = await self._json_request("GET", api, params=params)
+        if not response.get("data", {}).get("user"):
+            logger.error(response)
+            messages = [error["message"] for error in response.get("errors", [])]
+            raise NazurinError(
+                "Failed to fetch user tweets: "
+                + ("\n".join(messages) or "empty response"),
+            )
+        return response
+
+    @Cache.lru(ttl=86400)
+    async def _user_tweets_operation(self) -> tuple[str, list[str]]:
+        """
+        Find the UserTweets query ID and its feature switches in X's main.js,
+        since the query ID changes from time to time.
+        """
+
+        if USER_TWEETS_QUERY_ID:
+            return USER_TWEETS_QUERY_ID, []
+        home_html = await self._get_home_page_source()
+        main_js = MAIN_JS_PATTERN.search(home_html)
+        if not main_js:
+            raise NazurinError("Failed to locate main.js from X home page")
+        main_js_text = await self._fetch_js_text(main_js.group(0))
+        operation = USER_TWEETS_OPERATION_PATTERN.search(main_js_text)
+        if not operation:
+            raise NazurinError(
+                "Failed to find UserTweets query ID in main.js, "
+                "try setting TWITTER_RETWEET_QUERY_ID",
+            )
+        query_id = operation.group(1)
+        feature_switches = re.findall(r'"([^"]+)"', operation.group(2))
+        logger.info("Discovered UserTweets query ID: {}", query_id)
+        return query_id, feature_switches
+
+    async def viewer_id(self) -> str:
+        """Find the user ID of the auth token owner."""
+
+        home_html = await self._get_home_page_source()
+        # twid cookie looks like "u=1234567890", URL-encoded
+        twid = WebAPI.cookies.get("twid")
+        twid = getattr(twid, "value", twid)
+        if twid and (match := re.search(r"\d+", unquote(twid))):
+            return match.group(0)
+        if match := re.search(r'"user_id":"(\d+)"', home_html):
+            return match.group(1)
+        raise NazurinError(
+            "Failed to find user ID of the auth token, "
+            "try setting TWITTER_RETWEET_USER_ID",
+        )
 
     async def _require_auth(self):
         if not WebAPI.headers.get(Headers.AUTH_TYPE):

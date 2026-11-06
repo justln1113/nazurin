@@ -32,6 +32,32 @@ To get one, follow these steps:
 
 _Added in v2.4.0_
 
+### TWITTER_RETWEET_WATCH
+
+:material-lightbulb-on: Optional, defaults to `false`, requires [`TWITTER_AUTH_TOKEN`](#twitter_auth_token)
+
+Periodically check the timeline of the auth token owner, and collect new retweets that have images or videos. When a retweeted tweet quotes another tweet, both are collected if they have media. The user's own tweets and quotes are ignored.
+
+On first start, it only records the latest tweet, past retweets are not collected. Errors are reported to `ADMIN_ID`, successful collections are not.
+
+### TWITTER_RETWEET_INTERVAL
+
+:material-lightbulb-on: Optional, defaults to `300`
+
+Polling interval of [`TWITTER_RETWEET_WATCH`](#twitter_retweet_watch) in seconds.
+
+### TWITTER_RETWEET_USER_ID
+
+:material-lightbulb-on: Optional, detected from [`TWITTER_AUTH_TOKEN`](#twitter_auth_token) by default
+
+Numeric ID of the user whose retweets are watched.
+
+### TWITTER_RETWEET_QUERY_ID
+
+:material-lightbulb-on: Optional, discovered from X web page by default
+
+Query ID of the `UserTweets` GraphQL operation, set it if discovery fails.
+
 ## Customizing Storage Path & File Name
 
 For more information, refer to [Customizing Storage Path & File Name](./index.md/#customizing-storage-path--file-name).
