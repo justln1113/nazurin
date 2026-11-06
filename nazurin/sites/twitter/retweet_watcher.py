@@ -4,12 +4,21 @@ by polling the user's timeline.
 """
 
 import asyncio
+from datetime import datetime, timedelta, timezone
 from html import escape
+
+from aiogram.filters import Command, CommandObject
+from aiogram.types import Message
 
 from nazurin import bot, config, dp
 from nazurin.database import Database
 from nazurin.utils import logger
-from nazurin.utils.exceptions import AlreadyExistsError, NazurinError
+from nazurin.utils.exceptions import (
+    AlreadyExistsError,
+    InvalidCommandUsageError,
+    NazurinError,
+)
+from nazurin.utils.filters import IDFilter
 from nazurin.utils.helpers import format_error
 
 from .api import Twitter
@@ -19,6 +28,27 @@ from .config import AUTH_TOKEN, RETWEET_INTERVAL, RETWEET_USER_ID, WATCH_RETWEET
 DOCUMENT = "twitter_retweet_watcher"
 # Pages to look back each poll, in case of many retweets since the last poll
 MAX_PAGES = 5
+# Pages to look back when backfilling, X serves about 3200 tweets at most
+BACKFILL_MAX_PAGES = 50
+# Seconds between collections when backfilling, to avoid hitting rate limits
+BACKFILL_DELAY = 3
+MAX_REPORTED_FAILURES = 20
+# Dates without time zone given to the backfill command
+LOCAL_TIMEZONE = timezone(timedelta(hours=8))
+TWITTER_EPOCH_MS = 1288834974657
+
+
+def snowflake_from_datetime(moment: datetime) -> int:
+    """Smallest tweet ID that could be created at `moment`."""
+    return (int(moment.timestamp() * 1000) - TWITTER_EPOCH_MS) << 22
+
+
+def parse_since(text: str) -> datetime:
+    """Parse "2026-10-28" or "2026-10-28T12:00", in local time if no time zone."""
+    moment = datetime.fromisoformat(text)
+    if moment.tzinfo is None:
+        moment = moment.replace(tzinfo=LOCAL_TIMEZONE)
+    return moment
 
 
 def describe(error: Exception) -> str:
@@ -93,7 +123,10 @@ class RetweetWatcher:
         self.api = Twitter.web
         self.user_id = RETWEET_USER_ID
         self.task: asyncio.Task | None = None
+        self.backfill_task: asyncio.Task | None = None
         self.last_error: str | None = None
+        # Polling and backfilling may collect the same tweets, don't run together
+        self.lock = asyncio.Lock()
 
     @staticmethod
     def document():
@@ -112,12 +145,16 @@ class RetweetWatcher:
             collection = Database().driver().collection(config.NAZURIN_DATA)
             await collection.insert(DOCUMENT, data)
 
-    async def fetch_new_tweets(self, last_id: int | None) -> list[dict]:
+    async def fetch_new_tweets(
+        self,
+        last_id: int | None,
+        max_pages: int = MAX_PAGES,
+    ) -> list[dict]:
         """Fetch tweets newer than `last_id`, oldest first."""
 
         tweets = []
         cursor = None
-        for _ in range(MAX_PAGES):
+        for _ in range(max_pages):
             response = await self.api.user_tweets(self.user_id, cursor)
             page, cursor = parse_timeline(response)
             tweets += [tweet for tweet in page if tweet_id(tweet) > (last_id or 0)]
@@ -127,10 +164,13 @@ class RetweetWatcher:
                 break
         return sorted(tweets, key=tweet_id)
 
-    async def poll(self):
+    async def ensure_user_id(self):
         if not self.user_id:
             self.user_id = await self.api.viewer_id()
             logger.info("Watching retweets of user {}", self.user_id)
+
+    async def poll(self):
+        await self.ensure_user_id()
         last_id = await self.load_last_id()
         tweets = await self.fetch_new_tweets(last_id)
         if not tweets:
@@ -142,10 +182,13 @@ class RetweetWatcher:
             return
         for tweet in tweets:
             for url in collectable_urls(tweet):
-                await self.collect(url)
+                if error := await self.collect(url):
+                    await self.notify(f"Error collecting retweet {url}: {error}")
             await self.save_last_id(tweet_id(tweet))
 
-    async def collect(self, url: str):
+    async def collect(self, url: str) -> str | None:
+        """Collect `url`, return the error message if failed."""
+
         logger.info("Collecting retweet {}", url)
         try:
             await bot.update_collection([url])
@@ -154,12 +197,58 @@ class RetweetWatcher:
         # pylint: disable-next=broad-exception-caught
         except Exception as error:
             logger.exception("Error collecting retweet {}", url)
-            await self.notify(f"Error collecting retweet {url}: {describe(error)}")
+            return describe(error)
+        return None
+
+    async def backfill(self, since: datetime) -> str:
+        """
+        Collect retweets made since `since`, return a report.
+        Already collected ones are skipped by the database check.
+        """
+
+        async with self.lock:
+            await self.ensure_user_id()
+            tweets = await self.fetch_new_tweets(
+                snowflake_from_datetime(since),
+                BACKFILL_MAX_PAGES,
+            )
+            urls = [url for tweet in tweets for url in collectable_urls(tweet)]
+            failures = []
+            for url in urls:
+                if error := await self.collect(url):
+                    failures.append(f"{url}: {error}")
+                await asyncio.sleep(BACKFILL_DELAY)
+        report = (
+            f"Retweet backfill since {since.isoformat()} finished.\n"
+            f"Tweets checked: {len(tweets)}, retweeted media: {len(urls)}, "
+            f"failed: {len(failures)}"
+        )
+        if failures:
+            report += "\n\n" + "\n".join(failures[:MAX_REPORTED_FAILURES])
+            if len(failures) > MAX_REPORTED_FAILURES:
+                report += f"\n...and {len(failures) - MAX_REPORTED_FAILURES} more"
+        return report
+
+    async def run_backfill(self, since: datetime):
+        try:
+            report = await self.backfill(since)
+        # pylint: disable-next=broad-exception-caught
+        except Exception as error:
+            logger.exception("Retweet backfill failed")
+            report = f"Retweet backfill failed: {describe(error)}"
+        await self.notify(report)
+
+    def start_backfill(self, since: datetime) -> bool:
+        if self.backfill_task and not self.backfill_task.done():
+            return False
+        self.backfill_task = asyncio.create_task(self.run_backfill(since))
+        return True
 
     async def run(self):
         while True:
             try:
-                await self.poll()
+                async with self.lock:
+                    await self.poll()
                 if self.last_error:
                     self.last_error = None
                     await self.notify("Retweet watcher recovered.")
@@ -194,8 +283,23 @@ class RetweetWatcher:
         self.task = asyncio.create_task(self.run())
 
     async def stop(self, *_args):
-        if self.task:
-            self.task.cancel()
+        for task in (self.task, self.backfill_task):
+            if task:
+                task.cancel()
+
+
+async def retweet_backfill(message: Message, command: CommandObject):
+    try:
+        since = parse_since(command.args.strip())
+    except (AttributeError, ValueError) as error:
+        raise InvalidCommandUsageError("retweet_backfill") from error
+    if not watcher.start_backfill(since):
+        await message.reply("A retweet backfill is already running.")
+        return
+    await message.reply(
+        f"Backfilling retweets since {since.isoformat()}, "
+        "a report will be sent when finished.",
+    )
 
 
 if WATCH_RETWEETS:
@@ -205,3 +309,13 @@ if WATCH_RETWEETS:
         watcher = RetweetWatcher()
         dp.startup.register(watcher.start)
         dp.shutdown.register(watcher.stop)
+        dp.message_handler(
+            IDFilter(config.ADMIN_ID),
+            Command("retweet_backfill"),
+            args="DATE",
+            description="Collect retweets made since DATE",
+            help_text=(
+                "DATE is like 2026-10-28 or 2026-10-28T12:00, "
+                "in UTC+8 unless a time zone is given."
+            ),
+        )(retweet_backfill)

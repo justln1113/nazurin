@@ -1,5 +1,6 @@
 import asyncio
 import re
+from datetime import datetime, timedelta, timezone
 
 from nazurin.sites.twitter import retweet_watcher
 from nazurin.sites.twitter.api.web import (
@@ -8,9 +9,12 @@ from nazurin.sites.twitter.api.web import (
 )
 from nazurin.sites.twitter.interface import patterns
 from nazurin.sites.twitter.retweet_watcher import (
+    TWITTER_EPOCH_MS,
     RetweetWatcher,
     collectable_urls,
+    parse_since,
     parse_timeline,
+    snowflake_from_datetime,
     status_url,
 )
 from nazurin.utils.exceptions import NazurinError
@@ -191,6 +195,7 @@ class FakeWatcher(RetweetWatcher):
         self.user_id = "42"
         self.last_id = last_id
         self.collected = []
+        self.errors = {}
 
     async def load_last_id(self):
         return self.last_id
@@ -200,6 +205,7 @@ class FakeWatcher(RetweetWatcher):
 
     async def collect(self, url: str):
         self.collected.append(url)
+        return self.errors.get(url)
 
 
 def test_poll_first_run_only_records_position():
@@ -237,3 +243,42 @@ def test_poll_error_is_reported_once_and_never_raises(monkeypatch):
     asyncio.run(watcher.on_poll_error(error))
     assert len(sent) == 1
     assert "Bad &lt;response&gt;" in sent[0]
+
+
+def test_snowflake_from_datetime():
+    moment = datetime(2026, 10, 28, tzinfo=timezone.utc)
+    snowflake = snowflake_from_datetime(moment)
+    assert (snowflake >> 22) + TWITTER_EPOCH_MS == moment.timestamp() * 1000
+    later = snowflake_from_datetime(moment + timedelta(milliseconds=1))
+    assert later > snowflake
+
+
+def test_parse_since_defaults_to_utc8():
+    assert parse_since("2026-10-28") == datetime(2026, 10, 27, 16, tzinfo=timezone.utc)
+    assert parse_since("2026-10-28T12:00+00:00") == datetime(
+        2026, 10, 28, 12, tzinfo=timezone.utc
+    )
+
+
+def test_backfill_collects_since_and_reports(monkeypatch):
+    monkeypatch.setattr(retweet_watcher, "BACKFILL_DELAY", 0)
+    since = datetime(2026, 10, 28, tzinfo=timezone.utc)
+    base = snowflake_from_datetime(since)
+
+    def retweet(offset: int, original: str) -> dict:
+        return make_tweet(
+            str(base + offset), retweet_of=make_tweet(original, media=True)
+        )
+
+    pages = [
+        make_page([retweet(3, "3"), retweet(2, "2")], cursor="page2"),
+        make_page([retweet(1, "1"), retweet(-1, "0")], cursor="page3"),
+    ]
+    watcher = FakeWatcher(pages, last_id=base + 10)
+    watcher.errors = {status_url("2"): "Bad tweet"}
+    report = asyncio.run(watcher.backfill(since))
+    assert watcher.collected == [status_url("1"), status_url("2"), status_url("3")]
+    # Backfilling doesn't move the polling position
+    assert watcher.last_id == base + 10
+    assert "retweeted media: 3, failed: 1" in report
+    assert f"{status_url('2')}: Bad tweet" in report

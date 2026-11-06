@@ -40,6 +40,8 @@ Periodically check the timeline of the auth token owner, and collect new retweet
 
 On first start, it only records the latest tweet, past retweets are not collected. Errors are reported to `ADMIN_ID`, successful collections are not.
 
+To collect past retweets, send `/retweet_backfill DATE` as the admin, e.g. `/retweet_backfill 2026-10-28`. `DATE` is in UTC+8 unless a time zone is given. Already collected tweets are skipped, and a report is sent when finished.
+
 ### TWITTER_RETWEET_INTERVAL
 
 :material-lightbulb-on: Optional, defaults to `300`
