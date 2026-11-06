@@ -4,6 +4,7 @@ by polling the user's timeline.
 """
 
 import asyncio
+import time
 from datetime import datetime, timedelta, timezone
 from html import escape
 
@@ -22,14 +23,17 @@ from nazurin.utils.filters import IDFilter
 from nazurin.utils.helpers import format_error
 
 from .api import Twitter
-from .api.web import WebAPI
+from .api.web import RateLimit, WebAPI
 from .config import AUTH_TOKEN, RETWEET_INTERVAL, RETWEET_USER_ID, WATCH_RETWEETS
 
 DOCUMENT = "twitter_retweet_watcher"
-# Pages to look back each poll, in case of many retweets since the last poll
-MAX_PAGES = 5
-# Pages to look back when backfilling, X serves about 3200 tweets at most
-BACKFILL_MAX_PAGES = 50
+# Safety limit of pages to look back, X serves about 3200 tweets at most
+MAX_PAGES = 50
+# Seconds between timeline pages
+PAGE_DELAY = 1
+# Wait for the rate limit to reset when fewer requests than this are left
+MIN_RATE_LIMIT_REMAINING = 2
+MAX_RATE_LIMIT_WAIT = 16 * 60
 # Seconds between collections when backfilling, to avoid hitting rate limits
 BACKFILL_DELAY = 3
 MAX_REPORTED_FAILURES = 20
@@ -41,6 +45,13 @@ TWITTER_EPOCH_MS = 1288834974657
 def snowflake_from_datetime(moment: datetime) -> int:
     """Smallest tweet ID that could be created at `moment`."""
     return (int(moment.timestamp() * 1000) - TWITTER_EPOCH_MS) << 22
+
+
+def datetime_from_snowflake(snowflake: int) -> datetime:
+    return datetime.fromtimestamp(
+        ((snowflake >> 22) + TWITTER_EPOCH_MS) / 1000,
+        tz=LOCAL_TIMEZONE,
+    )
 
 
 def parse_since(text: str) -> datetime:
@@ -145,24 +156,43 @@ class RetweetWatcher:
             collection = Database().driver().collection(config.NAZURIN_DATA)
             await collection.insert(DOCUMENT, data)
 
-    async def fetch_new_tweets(
-        self,
-        last_id: int | None,
-        max_pages: int = MAX_PAGES,
-    ) -> list[dict]:
-        """Fetch tweets newer than `last_id`, oldest first."""
+    async def fetch_new_tweets(self, last_id: int | None) -> tuple[list[dict], bool]:
+        """
+        Fetch tweets newer than `last_id`, oldest first,
+        and whether the timeline was read back to `last_id`.
+        """
 
         tweets = []
         cursor = None
-        for _ in range(max_pages):
+        for page_number in range(MAX_PAGES):
+            if page_number:
+                await asyncio.sleep(PAGE_DELAY)
+            await self.wait_for_rate_limit("UserTweets")
             response = await self.api.user_tweets(self.user_id, cursor)
-            page, cursor = parse_timeline(response)
+            page, next_cursor = parse_timeline(response)
             tweets += [tweet for tweet in page if tweet_id(tweet) > (last_id or 0)]
             # Stop once reaching tweets seen before; on first run, only take a look
-            reached_seen = any(tweet_id(tweet) <= (last_id or 0) for tweet in page)
-            if last_id is None or reached_seen or not page or not cursor:
+            reached = last_id is None or any(
+                tweet_id(tweet) <= last_id for tweet in page
+            )
+            # Also stop at the end of the timeline, or if the cursor stops moving
+            if reached or not page or not next_cursor or next_cursor == cursor:
                 break
-        return sorted(tweets, key=tweet_id)
+            cursor = next_cursor
+        return sorted(tweets, key=tweet_id), reached
+
+    @staticmethod
+    async def wait_for_rate_limit(operation: str):
+        """Wait for the rate limit of `operation` to reset if it's almost reached."""
+
+        limit: RateLimit | None = WebAPI.rate_limits.get(operation)
+        if not limit or limit.remaining >= MIN_RATE_LIMIT_REMAINING:
+            return
+        delay = min(limit.reset - time.time() + 1, MAX_RATE_LIMIT_WAIT)
+        if delay <= 0:
+            return
+        logger.info("{} rate limit almost reached, waiting {:.0f}s", operation, delay)
+        await asyncio.sleep(delay)
 
     async def ensure_user_id(self):
         if not self.user_id:
@@ -172,14 +202,27 @@ class RetweetWatcher:
     async def poll(self):
         await self.ensure_user_id()
         last_id = await self.load_last_id()
-        tweets = await self.fetch_new_tweets(last_id)
+        tweets, complete = await self.fetch_new_tweets(last_id)
         if not tweets:
+            if not complete:
+                # Raised to be reported once until it recovers
+                raise NazurinError("Timeline returned no tweets")
             return
         if last_id is None:
             # First run, start from now instead of collecting past retweets
             await self.save_last_id(tweet_id(tweets[-1]))
             logger.info("Retweet watcher started from tweet {}", tweet_id(tweets[-1]))
             return
+        if not complete:
+            since = datetime_from_snowflake(last_id).strftime("%Y-%m-%dT%H:%M")
+            until = datetime_from_snowflake(tweet_id(tweets[0])).strftime(
+                "%Y-%m-%dT%H:%M"
+            )
+            await self.notify(
+                "Retweet watcher couldn't read the timeline back to the last "
+                f"seen tweet, retweets made between {since} and {until} may be "
+                f"missed. Send /retweet_backfill {since} to collect them.",
+            )
         for tweet in tweets:
             for url in collectable_urls(tweet):
                 if error := await self.collect(url):
@@ -190,6 +233,7 @@ class RetweetWatcher:
         """Collect `url`, return the error message if failed."""
 
         logger.info("Collecting retweet {}", url)
+        await self.wait_for_rate_limit("TweetDetail")
         try:
             await bot.update_collection([url])
         except AlreadyExistsError:
@@ -208,9 +252,8 @@ class RetweetWatcher:
 
         async with self.lock:
             await self.ensure_user_id()
-            tweets = await self.fetch_new_tweets(
+            tweets, complete = await self.fetch_new_tweets(
                 snowflake_from_datetime(since),
-                BACKFILL_MAX_PAGES,
             )
             urls = [url for tweet in tweets for url in collectable_urls(tweet)]
             failures = []
@@ -223,6 +266,11 @@ class RetweetWatcher:
             f"Tweets checked: {len(tweets)}, retweeted media: {len(urls)}, "
             f"failed: {len(failures)}"
         )
+        if not complete:
+            report += (
+                f"\nCouldn't read the timeline back to {since.isoformat()}, "
+                "older retweets were not checked."
+            )
         if failures:
             report += "\n\n" + "\n".join(failures[:MAX_REPORTED_FAILURES])
             if len(failures) > MAX_REPORTED_FAILURES:

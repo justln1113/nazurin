@@ -4,6 +4,7 @@ import json
 import re
 import secrets
 from contextlib import asynccontextmanager
+from dataclasses import dataclass
 from datetime import datetime, timezone
 from http import HTTPStatus
 from typing import TYPE_CHECKING, ClassVar
@@ -36,6 +37,7 @@ class Headers:
     CSRF_TOKEN = "x-csrf-token"
     AUTH_TYPE = "x-twitter-auth-type"
     RATE_LIMIT_LIMIT = "x-rate-limit-limit"
+    RATE_LIMIT_REMAINING = "x-rate-limit-remaining"
     RATE_LIMIT_RESET = "x-rate-limit-reset"
     CLIENT_TRANSACTION_ID = "x-client-transaction-id"
     REFERER = "referer"
@@ -52,6 +54,13 @@ class AuthorizationToken:
         "Bearer AAAAAAAAAAAAAAAAAAAAANRILgAAAAAAnNwIzUejRCOuH"
         "5E6I8xnZz4puTs%3D1Zv7ttfk8LF81IUq16cHjhLTvJu4FA33AGWWjCpTnA"
     )
+
+
+@dataclass
+class RateLimit:
+    remaining: int
+    # Unix timestamp when the limit resets
+    reset: int
 
 
 class TweetDetailAPI:
@@ -86,6 +95,8 @@ class WebAPI(BaseAPI):
         "x-twitter-client-language": "en",
         "x-twitter-active-user": "yes",
     }
+    # Latest rate limit of each GraphQL operation, e.g. "UserTweets"
+    rate_limits: ClassVar[dict[str, RateLimit]] = {}
     variables: ClassVar[dict[str, bool]] = {
         "with_rux_injections": False,
         "includePromotedContent": False,
@@ -377,6 +388,7 @@ class WebAPI(BaseAPI):
                 response.headers,
                 response.cookies,
             )
+            WebAPI._update_rate_limit(url, response.headers)
             if not response.ok:
                 result = await response.text()
                 logger.error("Web API Error: {}, {}", response.status, result)
@@ -404,6 +416,18 @@ class WebAPI(BaseAPI):
                     )
             WebAPI._update_cookies(response.cookies)
             yield response
+
+    @staticmethod
+    def _update_rate_limit(url: str, headers):
+        if (
+            Headers.RATE_LIMIT_REMAINING in headers
+            and Headers.RATE_LIMIT_RESET in headers
+        ):
+            operation = urlparse(url).path.rsplit("/", 1)[-1]
+            WebAPI.rate_limits[operation] = RateLimit(
+                int(headers[Headers.RATE_LIMIT_REMAINING]),
+                int(headers[Headers.RATE_LIMIT_RESET]),
+            )
 
     @staticmethod
     def _update_cookies(cookies: SimpleCookie):

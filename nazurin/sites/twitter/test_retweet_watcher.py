@@ -1,23 +1,36 @@
 import asyncio
 import re
+import time
 from datetime import datetime, timedelta, timezone
+
+import pytest
 
 from nazurin.sites.twitter import retweet_watcher
 from nazurin.sites.twitter.api.web import (
     MAIN_JS_PATTERN,
     USER_TWEETS_OPERATION_PATTERN,
+    RateLimit,
+    WebAPI,
 )
 from nazurin.sites.twitter.interface import patterns
 from nazurin.sites.twitter.retweet_watcher import (
     TWITTER_EPOCH_MS,
     RetweetWatcher,
     collectable_urls,
+    datetime_from_snowflake,
     parse_since,
     parse_timeline,
     snowflake_from_datetime,
     status_url,
 )
 from nazurin.utils.exceptions import NazurinError
+
+
+@pytest.fixture(autouse=True)
+def no_delays(monkeypatch):
+    monkeypatch.setattr(retweet_watcher, "PAGE_DELAY", 0)
+    monkeypatch.setattr(retweet_watcher, "BACKFILL_DELAY", 0)
+    monkeypatch.setattr(WebAPI, "rate_limits", {})
 
 
 def make_tweet(
@@ -166,8 +179,9 @@ def fetch_ids(pages: list[dict], last_id: int | None):
     watcher = RetweetWatcher()
     watcher.api = FakeAPI(pages)
     watcher.user_id = "42"
-    tweets = asyncio.run(watcher.fetch_new_tweets(last_id))
-    return [int(tweet["rest_id"]) for tweet in tweets], watcher.api.cursors
+    tweets, complete = asyncio.run(watcher.fetch_new_tweets(last_id))
+    ids = [int(tweet["rest_id"]) for tweet in tweets]
+    return ids, watcher.api.cursors, complete
 
 
 def test_fetch_new_tweets_stops_at_seen():
@@ -176,16 +190,81 @@ def test_fetch_new_tweets_stops_at_seen():
         make_page([make_tweet("15"), make_tweet("10")], cursor="page3"),
         make_page([make_tweet("5")], cursor="page4"),
     ]
-    ids, cursors = fetch_ids(pages, last_id=10)
+    ids, cursors, complete = fetch_ids(pages, last_id=10)
     assert ids == [15, 20, 30]
     assert cursors == [None, "page2"]
+    assert complete
 
 
 def test_fetch_new_tweets_first_run_takes_one_page():
     pages = [make_page([make_tweet("30"), make_tweet("20")], cursor="page2")]
-    ids, cursors = fetch_ids(pages, last_id=None)
+    ids, cursors, complete = fetch_ids(pages, last_id=None)
     assert ids == [20, 30]
     assert cursors == [None]
+    assert complete
+
+
+def test_fetch_new_tweets_pages_until_seen():
+    pages = [
+        make_page([make_tweet(str(id_))], cursor=f"page{id_}")
+        for id_ in range(100, 0, -10)
+    ]
+    ids, cursors, complete = fetch_ids(pages, last_id=10)
+    assert ids == list(range(20, 101, 10))
+    assert len(cursors) == len(pages)
+    assert complete
+
+
+def test_fetch_new_tweets_stops_when_cursor_repeats():
+    pages = [
+        make_page([make_tweet("30")], cursor="page2"),
+        make_page([make_tweet("20")], cursor="page2"),
+    ]
+    ids, cursors, complete = fetch_ids(pages, last_id=10)
+    assert ids == [20, 30]
+    assert cursors == [None, "page2"]
+    assert not complete
+
+
+def test_fetch_new_tweets_stops_at_max_pages(monkeypatch):
+    monkeypatch.setattr(retweet_watcher, "MAX_PAGES", 2)
+    pages = [
+        make_page([make_tweet(str(id_))], cursor=f"page{id_}") for id_ in (40, 30, 20)
+    ]
+    ids, cursors, complete = fetch_ids(pages, last_id=10)
+    assert ids == [30, 40]
+    assert cursors == [None, "page40"]
+    assert not complete
+
+
+def test_wait_for_rate_limit(monkeypatch):
+    slept = []
+
+    async def sleep(delay):
+        slept.append(delay)
+
+    monkeypatch.setattr(retweet_watcher.asyncio, "sleep", sleep)
+    now = time.time()
+    reset = int(now) + 100
+    WebAPI.rate_limits["UserTweets"] = RateLimit(remaining=10, reset=reset)
+    asyncio.run(RetweetWatcher.wait_for_rate_limit("UserTweets"))
+    assert slept == []
+    WebAPI.rate_limits["UserTweets"] = RateLimit(remaining=1, reset=reset)
+    asyncio.run(RetweetWatcher.wait_for_rate_limit("UserTweets"))
+    assert len(slept) == 1
+    assert 0 < slept[0] <= reset - now + 1
+    # Already reset
+    WebAPI.rate_limits["UserTweets"] = RateLimit(remaining=0, reset=reset - 200)
+    asyncio.run(RetweetWatcher.wait_for_rate_limit("UserTweets"))
+    assert len(slept) == 1
+
+
+def test_rate_limit_is_recorded_by_operation():
+    WebAPI._update_rate_limit(
+        "https://x.com/i/api/graphql/abc/UserTweets",
+        {"x-rate-limit-remaining": "3", "x-rate-limit-reset": "1700000000"},
+    )
+    assert WebAPI.rate_limits["UserTweets"] == RateLimit(3, 1700000000)
 
 
 class FakeWatcher(RetweetWatcher):
@@ -229,6 +308,30 @@ def test_poll_collects_new_retweets_in_order():
     assert watcher.last_id == int(tweets[0]["rest_id"])
 
 
+def test_poll_reports_gap_but_still_collects(monkeypatch):
+    sent = []
+
+    async def send_message(_chat_id, text):
+        sent.append(text)
+
+    monkeypatch.setattr(retweet_watcher.bot, "send_message", send_message)
+    monkeypatch.setattr(retweet_watcher, "MAX_PAGES", 1)
+    since = datetime(2026, 10, 28, tzinfo=timezone.utc)
+    last_id = snowflake_from_datetime(since)
+    retweet = make_tweet(str(last_id + 1), retweet_of=make_tweet("1", media=True))
+    watcher = FakeWatcher([make_page([retweet], cursor="page2")], last_id=last_id)
+    asyncio.run(watcher.poll())
+    assert watcher.collected == [status_url("1")]
+    assert len(sent) == 1
+    assert "/retweet_backfill 2026-10-28T08:00" in sent[0]
+
+
+def test_poll_empty_timeline_is_an_error():
+    watcher = FakeWatcher([make_page([])], last_id=10)
+    with pytest.raises(NazurinError):
+        asyncio.run(watcher.poll())
+
+
 def test_poll_error_is_reported_once_and_never_raises(monkeypatch):
     sent = []
 
@@ -253,6 +356,11 @@ def test_snowflake_from_datetime():
     assert later > snowflake
 
 
+def test_datetime_from_snowflake():
+    moment = datetime(2026, 10, 28, 12, 34, 56, tzinfo=timezone.utc)
+    assert datetime_from_snowflake(snowflake_from_datetime(moment)) == moment
+
+
 def test_parse_since_defaults_to_utc8():
     assert parse_since("2026-10-28") == datetime(2026, 10, 27, 16, tzinfo=timezone.utc)
     assert parse_since("2026-10-28T12:00+00:00") == datetime(
@@ -260,8 +368,7 @@ def test_parse_since_defaults_to_utc8():
     )
 
 
-def test_backfill_collects_since_and_reports(monkeypatch):
-    monkeypatch.setattr(retweet_watcher, "BACKFILL_DELAY", 0)
+def test_backfill_collects_since_and_reports():
     since = datetime(2026, 10, 28, tzinfo=timezone.utc)
     base = snowflake_from_datetime(since)
 
@@ -282,3 +389,12 @@ def test_backfill_collects_since_and_reports(monkeypatch):
     assert watcher.last_id == base + 10
     assert "retweeted media: 3, failed: 1" in report
     assert f"{status_url('2')}: Bad tweet" in report
+    assert "Couldn't read" not in report
+
+
+def test_backfill_reports_unreached_date():
+    since = datetime(2026, 10, 28, tzinfo=timezone.utc)
+    base = snowflake_from_datetime(since)
+    pages = [make_page([make_tweet(str(base + 1))])]
+    report = asyncio.run(FakeWatcher(pages, last_id=None).backfill(since))
+    assert "Couldn't read the timeline back to" in report
