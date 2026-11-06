@@ -6,7 +6,7 @@ from aiogram import Bot, flags
 from aiogram.client.default import DefaultBotProperties
 from aiogram.client.session.aiohttp import AiohttpSession
 from aiogram.enums import ChatAction, ParseMode
-from aiogram.exceptions import TelegramBadRequest
+from aiogram.exceptions import TelegramBadRequest, TelegramEntityTooLarge
 from aiogram.types import FSInputFile, InputMediaPhoto, Message
 
 from nazurin import config
@@ -26,6 +26,8 @@ from nazurin.utils.helpers import (
 
 TG_GROUP_NUMBER_LIMIT = 10
 TG_GROUP_SIZE_LIMIT = 50 * 1024 * 1024  # 50 MB
+# Bots can't upload larger files
+TG_UPLOAD_SIZE_LIMIT = 50 * 1024 * 1024  # 50 MB
 
 
 class NazurinBot(Bot):
@@ -118,18 +120,41 @@ class NazurinBot(Bot):
             reply_to = None
         try:
             if isinstance(illust, Ugoira):
-                # Note: Videos have a 50MB limit, but we only resize images for now
-                await self.send_animation(
-                    chat_id,
-                    FSInputFile(illust.video.path),  # TODO: Handle URL
-                    caption=sanitize_caption(illust.caption),
-                    reply_to_message_id=reply_to,
-                )
+                await self.send_video(illust, chat_id, reply_to)
             else:
                 await illust.download()
                 await self.send_photos(illust, chat_id, reply_to)
         except TelegramBadRequest as error:
             await handle_bad_request(message, error)
+
+    async def send_video(
+        self,
+        illust: Ugoira,
+        chat_id: int,
+        reply_to: int | None = None,
+    ):
+        caption = sanitize_caption(illust.caption)
+        size = await illust.video.size()
+        if not size or size <= TG_UPLOAD_SIZE_LIMIT:
+            try:
+                await self.send_animation(
+                    chat_id,
+                    FSInputFile(illust.video.path),  # TODO: Handle URL
+                    caption=caption,
+                    reply_to_message_id=reply_to,
+                )
+                return
+            except TelegramEntityTooLarge:
+                pass
+        # Videos aren't resized, send the caption instead so that
+        # collecting can go on
+        logger.warning("Video {} is too large to send", illust.video.path)
+        size_text = f" ({size / 1024 / 1024:.1f} MB)" if size else ""
+        await self.send_message(
+            chat_id,
+            f"{caption}\n\nVideo is too large to send via Telegram{size_text}.",
+            reply_to_message_id=reply_to,
+        )
 
     @retry_after
     @telegram_retry

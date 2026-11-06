@@ -6,6 +6,7 @@ from typing import ClassVar
 
 import tenacity
 from aiogram.exceptions import (
+    TelegramEntityTooLarge,
     TelegramNetworkError,
     TelegramRetryAfter,
     TelegramServerError,
@@ -52,8 +53,10 @@ def telegram_exception_predicate(exception):
 
     Covers request timeouts (TelegramNetworkError, e.g. "Request timeout error")
     and upstream 5xx errors (TelegramServerError). Flood limits are handled
-    separately by `retry_after`.
+    separately by `retry_after`. Files too large always fail, don't retry.
     """
+    if isinstance(exception, TelegramEntityTooLarge):
+        return False
     return isinstance(exception, TelegramNetworkError | TelegramServerError)
 
 
